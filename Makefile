@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= ghcr.io/niklasbeierl/foip-operator/operator:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -101,6 +101,26 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
+
+##@ Helm
+
+HELM ?= helm
+CHART_VERSION ?= 0.1.0
+
+.PHONY: helm-lint
+helm-lint: ## Lint the Helm chart.
+	$(HELM) lint charts/foip-operator
+
+.PHONY: helm-package
+helm-package: ## Package the Helm chart into bin/.
+	$(HELM) package charts/foip-operator \
+		--version $(CHART_VERSION) \
+		--app-version $(CHART_VERSION) \
+		--destination dist/
+
+.PHONY: helm-push
+helm-push: helm-package ## Package and push the Helm chart to ghcr.io/niklasbeierl.
+	$(HELM) push dist/foip-operator-$(CHART_VERSION).tgz oci://ghcr.io/niklasbeierl
 
 ##@ Build
 

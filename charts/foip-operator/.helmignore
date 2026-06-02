@@ -1,0 +1,7 @@
+.helmignore
+*.orig
+*.bak
+~*
+.hg
+.git
+.gitignore

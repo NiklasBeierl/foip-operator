@@ -1,0 +1,59 @@
+image:
+  repository: ghcr.io/niklasbeierl/foip-operator/operator
+  pullPolicy: IfNotPresent
+  # Overrides the image tag; defaults to the chart appVersion (latest).
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# FailoverIp resources to create at install time.
+# - name: my-foip
+#   ip: 1.2.3.4
+#   secretName: netcup-scp-credentials
+failoverIps: []
+
+# Additional pre-existing secrets the foip operator should be allowed to read.
+# Secrets referenced in failoverIps are included automatically.
+existingSecrets: []
+
+controller:
+  serviceAccount:
+    create: true
+    annotations: {}
+    name: ""
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+  resources:
+    limits:
+      cpu: 500m
+      memory: 128Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+nodeInterface:
+  serviceAccount:
+    create: true
+    annotations: {}
+    name: ""
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}

@@ -1,0 +1,12 @@
+{{- range .Values.failoverIps }}
+---
+apiVersion: foip.noshoes.xyz/v1
+kind: FailoverIp
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "foip-operator.labels" $ | nindent 4 }}
+spec:
+  ip: {{ .ip }}
+  secretName: {{ .secretName }}
+{{- end }}

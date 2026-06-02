@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "foip-operator.fullname" . }}-node-interface
+  labels:
+    {{- include "foip-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-interface
+spec:
+  selector:
+    matchLabels:
+      {{- include "foip-operator.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: node-interface
+  template:
+    metadata:
+      {{- with .Values.nodeInterface.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "foip-operator.labels" . | nindent 8 }}
+        app.kubernetes.io/component: node-interface
+        {{- with .Values.nodeInterface.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "foip-operator.nodeInterface.serviceAccountName" . }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.nodeInterface.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: node-interface
+        image: {{ include "foip-operator.image" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: [/node-interface]
+        args:
+          - --health-probe-bind-address=:8082
+        securityContext:
+          capabilities:
+            add: [NET_ADMIN]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8082
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8082
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        {{- with .Values.nodeInterface.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- with .Values.nodeInterface.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeInterface.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeInterface.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
