@@ -65,7 +65,7 @@ func main() {
 		Scheme:                 scheme,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "foip-operator.controller.noshoes.xyz",
+		LeaderElectionID:       "controller.foip.noshoes.xyz",
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
