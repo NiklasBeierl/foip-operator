@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- netcup_v1_failoverip.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
