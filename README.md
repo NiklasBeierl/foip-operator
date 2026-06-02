@@ -1,121 +1,204 @@
 # foip-operator
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+This operator monitors node objects and assigns a netcup failover IP to one of the 
+"healthiest" nodes. It can be used as a "poor man's load balancer" for the control 
+plane or services on a Kubernetes cluster running in netcup. The operator also ensures 
+that each node's network interface is configured to receive traffic for the failover IP.
 
-## Getting Started
+Built in Go using [kubebuilder](https://book.kubebuilder.io/) and the 
+[netcup SCP REST API](https://www.netcup.com/en/helpcenter/documentation/servercontrolpanel/api).
+
+## Motivation
+
+I wanted a single point of contact for a cluster hosted in netcup, without adding extra 
+nodes for "real" load balancers. As of writing, netcup does not offer managed load 
+balancers. My solution is to automatically assign a failover IP to one of the 
+"healthiest" nodes. This solves two problems:
+
+1. It allows maintenance on individual nodes without paying too much attention to networking.
+2. It recovers connectivity if the currently serving node becomes unhealthy or is lost.
+
+## Limitations
+
+Especially for problem 2, this approach is **not** the best solution. Failover only 
+happens once the control plane detects that the node is unhealthy, which may take from
+seconds to a few minutes. Rerouting the failover IP also takes a few seconds.
+
+Another important consideration: **netcup failover IPs can only be re-assigned every 5 
+minutes**.
+
+## Project status
+
+This project is *works-for-the-author*-grade software. I am happy to review PRs that 
+improve it or add flexibility, but there are no guarantees.
+
+I'd be open to adding support for other hosting providers with similar mechanisms, for
+example Hetzner floating ips.
+
+## Architecture
+
+There are two controllers that run as separate workloads.
+
+### foip controller (Deployment)
+
+Monitors nodes and `FailoverIp` resources. Ensures the failover IP is routed to one of 
+the "healthiest" nodes via the netcup SCP REST API. Runs with leader election so only 
+one instance is active at a time.
+
+### node-interface controller (DaemonSet)
+
+Runs on every node. Checks whether a  failover IP should be routed to this node and 
+ensures the IP is assigned to the correct network interface. This means **you don't have
+to handle network configuration of your nodes manually**.
+
+### Choosing the healthiest node
+
+Several node conditions are checked and ordered by severity. The node with the 
+fewest or least severe issues is chosen:
+
+```
+NetworkUnavailable=True    # Networking broken
+Ready=False                # Node probably lost
+Ready=Unknown              # Node probably lost
+spec.unschedulable         # Cordoned
+PIDPressure=True           # System resource pressure
+MemoryPressure=True
+DiskPressure=True
+```
+
+A node switch only happens if a strictly healthier node is available. 
+Equal health does not lead to a switch (avoids alphabetical flip-flop).
+
+### netcup REST Api
+
+The netcup SCP REST API is documented [here](https://www.netcup.com/en/helpcenter/documentation/servercontrolpanel/api).
+
+The new netcup rest api authenticates with OIDC. As of writing, the only way to get a 
+long-lived credential for automation is to obtain a refresh token with the device login 
+flow. Because that is not very ergonomic, this repo builds a small helper binary
+`netcup-auth` (see below). The refresh token must be used at least once 
+every 30 days to not expire. The controller should ensure this since it fetches 
+the status of the failover ip for every reconcile and reconciles at least every 
+24 hours.
+
+## Installation
 
 ### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+- A Kubernetes cluster
+- `kubectl` configured to access it
+- `helm` v3
+- A netcup account with at least one failover IP and the [SCP Webservice](https://helpcenter.netcup.com/en/wiki/server/scp-webservice/) activated
 
-```sh
-make docker-build docker-push IMG=<some-registry>/foip-operator:tag
-```
+### 1. Credentials
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
+Generate an OAuth2 offline refresh token using the included helper:
 
 ```sh
-make install
+go run ./cmd/netcup-auth/ --namespace <namespace> --secret-name netcup-scp-credentials
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+This opens a browser for the netcup device login flow, then prints a ready-to-paste 
+`kubectl create secret` command containing `userId` and `refreshToken`.
+
+### 2. Node annotations
+
+The operator identifies which netcup server each Kubernetes node corresponds to via 
+two annotations. When you view your server in the new SCP UI (in beta as of writing) you
+can get the server id from the URL and the primary MAC in the network section.
+Then you can annotate your nodes like this:
 
 ```sh
-make deploy IMG=<some-registry>/foip-operator:tag
+kubectl annotate node <nodename> \
+  foip.noshoes.xyz/server-id=<integer-server-id> \
+  foip.noshoes.xyz/primary-mac=<mac-address>
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+Only nodes with both annotations are considered for assignment.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+
+### 3. Install the chart
 
 ```sh
-kubectl apply -k config/samples/
+helm install foip-operator oci://ghcr.io/niklasbeierl/foip-operator \
+  --namespace <namespace> \
+  --version <version> \
+  -f my-values.yaml
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+Helm unfortunately can't list available versions from oci registries yet, but you can
+for example use skopeo.
 
 ```sh
-kubectl delete -k config/samples/
+kopeo list-tags docker://ghcr.io/niklasbeierl/foip-operator
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+To get the default values:
 
 ```sh
-make uninstall
+helm show values oci://ghcr.io/niklasbeierl/foip-operator --version <version>
 ```
 
-**UnDeploy the controller from the cluster:**
+### 4. Create a FailoverIp resource (Optional)
+
+If you don't want to specify your foip in the helm values, you can create it manually. 
+In that case you need to grant the controller service account access to the secret, 
+either with a new Role and RoleBinding or by adding its name to `existingSecrets` in the 
+helm values.
+
+```yaml
+# failoverip.yaml
+apiVersion: foip.noshoes.xyz/v1
+kind: FailoverIp
+metadata:
+  name: my-failover-ip
+  namespace: <namespace>
+spec:
+  ip: 1.2.3.4
+  secretName: netcup-scp-credentials
+```
 
 ```sh
-make undeploy
+kubectl apply -f failoverip.yaml
 ```
 
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
+### Checking status
 
 ```sh
-make build-installer IMG=<some-registry>/foip-operator:tag
+kubectl describe foip my-failover-ip
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+```
+Spec:
+  Ip:           1.2.3.4
+  Secret Name:  netcup-scp-credentials
+Status:
+  Assigned Node:      node-1
+  Desired Node:       node-1
+  Last Sync Attempt:  2026-06-02T14:00:00Z
+  Last Sync Success:  2026-06-02T14:00:01Z
+```
 
-2. Using the installer
+### Troubleshooting
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
+Check logs across all operator pods:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/foip-operator/<tag or branch>/dist/install.yaml
+kubectl logs -l app.kubernetes.io/name=foip-operator \
+  --all-containers --prefix -f --max-log-requests 10
 ```
 
-### By providing a Helm Chart
+If you want to access LoadBalancer services (e.g. via klipper/ServiceLB/Cilium 
+Node IPAM LB) through the failover IP, add it as an external IP to the service:
 
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
+```yaml
+# ...
+spec:
+# ...
+  externalIPs:
+    - 1.2.3.4
+# ...
 ```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
 
 ## License
 
@@ -132,4 +215,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
