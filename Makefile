@@ -108,6 +108,7 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 build: manifests generate fmt vet ## Build foip and node-interface binaries.
 	go build -o bin/foip ./cmd/foip/
 	go build -o bin/node-interface ./cmd/node-interface/
+	go build -o bin/netcup-auth ./cmd/netcup-auth/
 
 .PHONY: run-foip
 run-foip: manifests generate fmt vet ## Run the foip controller from your host (no leader election).

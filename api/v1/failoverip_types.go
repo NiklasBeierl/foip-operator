@@ -21,8 +21,12 @@ import (
 )
 
 const (
-	MACAnnotation        = "foip.noshoes.xyz/primary-mac"
-	ServerNameAnnotation = "foip.noshoes.xyz/server-name"
+	// MACAnnotation is the node annotation holding the primary interface MAC address.
+	// Used by the node-interface controller to bind the failover IP to the right interface.
+	MACAnnotation = "foip.noshoes.xyz/primary-mac"
+	// ServerIDAnnotation is the node annotation holding the netcup server ID (integer).
+	// Used by the foip controller to route the failover IP via the SCP REST API.
+	ServerIDAnnotation = "foip.noshoes.xyz/server-id"
 )
 
 type FailoverIpSpec struct {
@@ -30,8 +34,8 @@ type FailoverIpSpec struct {
 	// +kubebuilder:validation:Required
 	IP string `json:"ip"`
 
-	// secretName is the name of the Secret containing netcup credentials.
-	// The Secret must have keys loginName and password.
+	// secretName is the name of the Secret containing netcup SCP credentials.
+	// The Secret must have keys refreshToken (OAuth2 offline token) and userId (netcup user ID).
 	// +kubebuilder:validation:Required
 	SecretName string `json:"secretName"`
 }

@@ -17,139 +17,193 @@ limitations under the License.
 package netcup
 
 import (
-	"bytes"
 	"context"
-	"encoding/xml"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
+	"time"
 )
 
-// soapEndpoint is the netcup vServer SOAP service URL (without ?wsdl).
-const soapEndpoint = "https://www.servercontrolpanel.de/WSEndUser"
+const (
+	scpBase  = "https://www.servercontrolpanel.de/scp-core"
+	tokenURL = "https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token"
+	clientID = "scp"
+)
 
-// soapNS is the target namespace declared in the WSDL.
-// Verify against https://www.servercontrolpanel.de/WSEndUser?wsdl if requests fail.
-const soapNS = "http://enduser.provider.netcup.de/"
-
-// Client calls the two netcup SOAP methods used for failover IP routing.
+// Client calls the netcup SCP REST API for failover IP management.
 type Client struct {
-	endpoint string
-	login    string
-	password string
-	http     *http.Client
+	userID       int
+	refreshToken string
+	http         *http.Client
+
+	mu          sync.Mutex
+	accessToken string
+	tokenExpiry time.Time
 }
 
-func New(login, password string) *Client {
+func New(userID int, refreshToken string) *Client {
 	return &Client{
-		endpoint: soapEndpoint,
-		login:    login,
-		password: password,
-		http:     &http.Client{},
+		userID:       userID,
+		refreshToken: refreshToken,
+		http:         &http.Client{},
 	}
 }
 
-// GetVServerIPs returns the IP addresses currently routed to the given vserver.
-func (c *Client) GetVServerIPs(ctx context.Context, vserverName string) ([]string, error) {
-	body := fmt.Sprintf(
-		`<ns:getVServerIPs xmlns:ns=%q><loginName>%s</loginName><password>%s</password><vserverName>%s</vserverName></ns:getVServerIPs>`,
-		soapNS, xmlEscape(c.login), xmlEscape(c.password), xmlEscape(vserverName),
-	)
-	resp, err := c.call(ctx, body)
+// token returns a valid access token, refreshing it if necessary.
+func (c *Client) token(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if time.Now().Before(c.tokenExpiry) {
+		return c.accessToken, nil
+	}
+	body := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {c.refreshToken},
+		"client_id":     {clientID},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(body.Encode()))
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-
-	var env struct {
-		Body struct {
-			Response struct {
-				Returns []string `xml:"return"`
-			} `xml:"getVServerIPsResponse"`
-			Fault *soapFault `xml:"Fault"`
-		} `xml:"Body"`
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("refreshing SCP token: %w", err)
 	}
-	if err := xml.Unmarshal(resp, &env); err != nil {
-		return nil, fmt.Errorf("parsing getVServerIPs response: %w", err)
+	defer func() { _ = resp.Body.Close() }()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading token response: %w", err)
 	}
-	if env.Body.Fault != nil {
-		return nil, fmt.Errorf("SOAP fault: %s", env.Body.Fault.FaultString)
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("SCP token refresh HTTP %d: %s", resp.StatusCode, data)
 	}
-	return env.Body.Response.Returns, nil
+	var tr struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(data, &tr); err != nil {
+		return "", fmt.Errorf("parsing token response: %w", err)
+	}
+	c.accessToken = tr.AccessToken
+	c.tokenExpiry = time.Now().Add(time.Duration(tr.ExpiresIn-30) * time.Second)
+	return c.accessToken, nil
 }
 
-// ChangeIPRouting reroutes ip/mask to the vserver identified by vserverName and mac.
-func (c *Client) ChangeIPRouting(ctx context.Context, ip string, mask int, vserverName, mac string) error {
-	body := fmt.Sprintf(
-		`<ns:changeIPRouting xmlns:ns=%q>`+
-			`<loginName>%s</loginName>`+
-			`<password>%s</password>`+
-			`<routedIP>%s</routedIP>`+
-			`<routedMask>%d</routedMask>`+
-			`<destinationVserverName>%s</destinationVserverName>`+
-			`<destinationInterfaceMAC>%s</destinationInterfaceMAC>`+
-			`</ns:changeIPRouting>`,
-		soapNS,
-		xmlEscape(c.login), xmlEscape(c.password),
-		xmlEscape(ip), mask,
-		xmlEscape(vserverName), xmlEscape(mac),
-	)
-	resp, err := c.call(ctx, body)
+// do executes an authenticated request against the SCP REST API.
+func (c *Client) do(ctx context.Context, method, path string, body io.Reader) ([]byte, int, error) {
+	tok, err := c.token(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, scpBase+path, body)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("SCP %s %s: %w", method, path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("reading SCP response: %w", err)
+	}
+	return data, resp.StatusCode, nil
+}
+
+type failoverIPv4 struct {
+	ID     int `json:"id"`
+	Server *struct {
+		ID int `json:"id"`
+	} `json:"server"`
+}
+
+// FindFailoverIP returns the resource ID of the failover IP and the server ID it
+// is currently routed to (0 if not yet routed anywhere).
+func (c *Client) FindFailoverIP(ctx context.Context, ip string) (foipID int, serverID int, err error) {
+	path := fmt.Sprintf("/api/v1/users/%d/failoverips/v4?ip=%s", c.userID, url.QueryEscape(ip))
+	data, status, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	if status != http.StatusOK {
+		return 0, 0, fmt.Errorf("list failover IPs HTTP %d: %s", status, data)
+	}
+	var ips []failoverIPv4
+	if err := json.Unmarshal(data, &ips); err != nil {
+		return 0, 0, fmt.Errorf("parsing failover IPs: %w", err)
+	}
+	if len(ips) == 0 {
+		return 0, 0, fmt.Errorf("failover IP %s not found in netcup account", ip)
+	}
+	fi := ips[0]
+	if fi.Server != nil {
+		serverID = fi.Server.ID
+	}
+	return fi.ID, serverID, nil
+}
+
+// RouteFailoverIP routes foipID to targetServerID and waits for the async task to finish.
+func (c *Client) RouteFailoverIP(ctx context.Context, foipID, targetServerID int) error {
+	path := fmt.Sprintf("/api/v1/users/%d/failoverips/v4/%d", c.userID, foipID)
+	body := fmt.Sprintf(`{"serverId":%d}`, targetServerID)
+	data, status, err := c.do(ctx, http.MethodPatch, path, strings.NewReader(body))
 	if err != nil {
 		return err
 	}
-
-	var env struct {
-		Body struct {
-			Fault *soapFault `xml:"Fault"`
-		} `xml:"Body"`
+	if status != http.StatusAccepted {
+		return fmt.Errorf("route failover IP HTTP %d: %s", status, data)
 	}
-	if err := xml.Unmarshal(resp, &env); err != nil {
-		return fmt.Errorf("parsing changeIPRouting response: %w", err)
+	var task struct {
+		UUID string `json:"uuid"`
 	}
-	if env.Body.Fault != nil {
-		return fmt.Errorf("SOAP fault: %s", env.Body.Fault.FaultString)
+	if err := json.Unmarshal(data, &task); err != nil {
+		return fmt.Errorf("parsing routing task response: %w", err)
 	}
-	return nil
+	return c.waitForTask(ctx, task.UUID)
 }
 
-type soapFault struct {
-	FaultCode   string `xml:"faultcode"`
-	FaultString string `xml:"faultstring"`
-}
-
-func (c *Client) call(ctx context.Context, bodyContent string) ([]byte, error) {
-	envelope := `<?xml version="1.0" encoding="UTF-8"?>` +
-		`<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">` +
-		`<soapenv:Header/>` +
-		`<soapenv:Body>` + bodyContent + `</soapenv:Body>` +
-		`</soapenv:Envelope>`
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, strings.NewReader(envelope))
-	if err != nil {
-		return nil, err
+func (c *Client) waitForTask(ctx context.Context, uuid string) error {
+	path := "/api/v1/tasks/" + uuid
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+		data, status, err := c.do(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("get task HTTP %d: %s", status, data)
+		}
+		var task struct {
+			State   string `json:"state"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(data, &task); err != nil {
+			return fmt.Errorf("parsing task: %w", err)
+		}
+		switch task.State {
+		case "FINISHED":
+			return nil
+		case "ERROR", "CANCELED", "ROLLBACK", "WAITING_FOR_CANCEL":
+			if task.Message != "" {
+				return fmt.Errorf("routing task %s: %s", task.State, task.Message)
+			}
+			return fmt.Errorf("routing task ended with state %s", task.State)
+		}
+		// PENDING or RUNNING → keep polling
 	}
-	req.Header.Set("Content-Type", "text/xml; charset=UTF-8")
-	req.Header.Set("SOAPAction", "")
-
-	res, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("netcup SOAP call: %w", err)
-	}
-	defer func() { _ = res.Body.Close() }()
-
-	data, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading netcup response: %w", err)
-	}
-	if res.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("netcup returned HTTP %d: %s", res.StatusCode, data)
-	}
-	return data, nil
-}
-
-func xmlEscape(s string) string {
-	var buf bytes.Buffer
-	_ = xml.EscapeText(&buf, []byte(s))
-	return buf.String()
 }

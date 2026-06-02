@@ -101,7 +101,7 @@ func candidateNodes(nodes []corev1.Node) []corev1.Node {
 	var out []corev1.Node
 	for _, n := range nodes {
 		if n.Annotations[netcupv1.MACAnnotation] != "" &&
-			n.Annotations[netcupv1.ServerNameAnnotation] != "" {
+			n.Annotations[netcupv1.ServerIDAnnotation] != "" {
 			out = append(out, n)
 		}
 	}

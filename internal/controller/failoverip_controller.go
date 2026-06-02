@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -42,14 +41,14 @@ import (
 // It runs as a Deployment with leader election; only one instance is active at a time.
 type FailoverIpReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme    *runtime.Scheme
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=foip.noshoes.xyz,resources=failoverips,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=foip.noshoes.xyz,resources=failoverips/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
-
 func (r *FailoverIpReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -78,26 +77,33 @@ func (r *FailoverIpReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	// Resolve the desired node's annotations.
+	// Resolve the target server ID from the desired node's annotation.
 	var targetNode corev1.Node
 	if err := r.Get(ctx, types.NamespacedName{Name: foip.Status.DesiredNode}, &targetNode); err != nil {
 		return ctrl.Result{}, err
 	}
-	mac := targetNode.Annotations[netcupv1.MACAnnotation]
-	vserverName := targetNode.Annotations[netcupv1.ServerNameAnnotation]
-	if mac == "" || vserverName == "" {
-		return ctrl.Result{}, fmt.Errorf("node %s is missing required annotations", foip.Status.DesiredNode)
+	serverIDStr := targetNode.Annotations[netcupv1.ServerIDAnnotation]
+	if serverIDStr == "" {
+		return ctrl.Result{}, fmt.Errorf("node %s missing annotation %s", foip.Status.DesiredNode, netcupv1.ServerIDAnnotation)
+	}
+	var targetServerID int
+	if _, err := fmt.Sscanf(serverIDStr, "%d", &targetServerID); err != nil {
+		return ctrl.Result{}, fmt.Errorf("node %s annotation %s is not an integer: %w", foip.Status.DesiredNode, netcupv1.ServerIDAnnotation, err)
 	}
 
-	// Fetch netcup credentials.
+	// Fetch netcup SCP credentials.
 	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Name: foip.Spec.SecretName, Namespace: req.Namespace}, &secret); err != nil {
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: foip.Spec.SecretName, Namespace: req.Namespace}, &secret); err != nil {
 		return ctrl.Result{}, fmt.Errorf("fetching secret %s: %w", foip.Spec.SecretName, err)
 	}
-	login := string(secret.Data["loginName"])
-	password := string(secret.Data["password"])
-	if login == "" || password == "" {
-		return ctrl.Result{}, fmt.Errorf("secret %s missing loginName or password", foip.Spec.SecretName)
+	refreshToken := string(secret.Data["refreshToken"])
+	userIDStr := string(secret.Data["userId"])
+	if refreshToken == "" || userIDStr == "" {
+		return ctrl.Result{}, fmt.Errorf("secret %s missing refreshToken or userId", foip.Spec.SecretName)
+	}
+	var userID int
+	if _, err := fmt.Sscanf(userIDStr, "%d", &userID); err != nil {
+		return ctrl.Result{}, fmt.Errorf("secret %s: userId is not an integer: %w", foip.Spec.SecretName, err)
 	}
 
 	// Record the attempt before touching the API.
@@ -107,20 +113,20 @@ func (r *FailoverIpReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	nc := netcup.New(login, password)
+	nc := netcup.New(userID, refreshToken)
 
-	ips, err := nc.GetVServerIPs(ctx, vserverName)
+	foipID, currentServerID, err := nc.FindFailoverIP(ctx, foip.Spec.IP)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("getVServerIPs: %w", err)
+		return ctrl.Result{}, fmt.Errorf("findFailoverIP: %w", err)
 	}
 
-	if !slices.Contains(ips, foip.Spec.IP) {
-		log.Info("Routing IP via netcup API", "ip", foip.Spec.IP, "node", foip.Status.DesiredNode)
-		if err := nc.ChangeIPRouting(ctx, foip.Spec.IP, 32, vserverName, mac); err != nil {
-			return ctrl.Result{}, fmt.Errorf("changeIPRouting: %w", err)
-		}
+	if currentServerID == targetServerID {
+		log.Info("IP already routed to target server in netcup", "ip", foip.Spec.IP, "serverID", targetServerID)
 	} else {
-		log.Info("IP already routed to target node in netcup", "ip", foip.Spec.IP, "node", foip.Status.DesiredNode)
+		log.Info("Routing IP via netcup SCP API", "ip", foip.Spec.IP, "serverID", targetServerID)
+		if err := nc.RouteFailoverIP(ctx, foipID, targetServerID); err != nil {
+			return ctrl.Result{}, fmt.Errorf("routeFailoverIP: %w", err)
+		}
 	}
 
 	patch = client.MergeFrom(foip.DeepCopy())
@@ -150,7 +156,7 @@ func (nodeChangePredicate) Update(e event.UpdateEvent) bool {
 		return true
 	}
 	if oldNode.Annotations[netcupv1.MACAnnotation] != newNode.Annotations[netcupv1.MACAnnotation] ||
-		oldNode.Annotations[netcupv1.ServerNameAnnotation] != newNode.Annotations[netcupv1.ServerNameAnnotation] {
+		oldNode.Annotations[netcupv1.ServerIDAnnotation] != newNode.Annotations[netcupv1.ServerIDAnnotation] {
 		return true
 	}
 	for _, condType := range []corev1.NodeConditionType{
@@ -182,6 +188,7 @@ func (r *FailoverIpReconciler) nodeToFoips(ctx context.Context, _ client.Object)
 }
 
 func (r *FailoverIpReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.APIReader = mgr.GetAPIReader()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&netcupv1.FailoverIp{}).
 		Watches(
