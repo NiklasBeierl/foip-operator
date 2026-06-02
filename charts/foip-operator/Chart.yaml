@@ -3,4 +3,4 @@ name: foip-operator
 description: Assign a netcup failover IP to healthy nodes automatically.
 type: application
 version: 0.1.0
-appVersion: "latest"
+appVersion: 0.1.0

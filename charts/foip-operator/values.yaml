@@ -19,6 +19,12 @@ failoverIps: []
 existingSecrets: []
 
 controller:
+  replicas: 2
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  podAntiAffinity:
+    enabled: true
   serviceAccount:
     create: true
     annotations: {}
